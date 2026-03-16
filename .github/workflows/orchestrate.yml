@@ -7,10 +7,12 @@
 # references repo-task-core.yml via `uses:`).
 #
 # Token strategy:
-#   - prepare job: uses actions/create-github-app-token@v1 scoped to the
-#     orchestrator repo for artifact download API calls.
-#   - dispatch job: uses actions/create-github-app-token@v1 scoped to each
-#     target repo's owner/name for per-repo workflow dispatch.
+#   - All jobs: actions/create-github-app-token@v1 scoped to the orchestrator
+#     repo (repositories: ${{ github.event.repository.name }}). This produces
+#     an installation token for the orchestrator's installation, which is used
+#     for all gh api / curl calls including dispatching to target repos.
+#   - Manual JWT generation is NOT needed here — it is only required in
+#     discover.yml for App-level endpoints (GET /app/installations).
 #
 # Triggers:
 #   - workflow_run: automatically after "Repository Discovery" completes successfully
@@ -81,7 +83,8 @@ jobs:
     steps:
       # -----------------------------------------------------------------------
       # Step 1: Generate installation token scoped to THIS (orchestrator) repo.
-      # Used for artifact download API calls scoped to this repo/org.
+      # Used for all gh api calls in this job (artifact download, workflow
+      # lookup). Scoping to the orchestrator repo is sufficient.
       # -----------------------------------------------------------------------
       - name: Generate app token (orchestrator repo)
         id: app-token
@@ -298,9 +301,10 @@ jobs:
 # Job 2: dispatch
 #
 # Matrix job — one runner per target repo.
-# Uses actions/create-github-app-token@v1 to mint a per-repo installation
-# token scoped to the target repo, then finds the caller workflow file and
-# triggers workflow_dispatch.
+# Uses actions/create-github-app-token@v1 scoped to the TARGET repo
+# (owner + name extracted from matrix.repo.repo) to obtain a token, then
+# uses that token with GH_TOKEN to find the caller workflow file and trigger
+# workflow_dispatch on the target repo.
 # ---------------------------------------------------------------------------
   dispatch:
     runs-on: ubuntu-latest
@@ -317,10 +321,13 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # Step 1: Extract owner and repo name from the matrix entry.
-      # Required so actions/create-github-app-token@v1 can be scoped correctly.
+      # Step 1a: Extract owner and name from the target repo slug.
+      #
+      # matrix.repo.repo is in "owner/name" format (e.g. "org/myrepo").
+      # Shell parameter expansion splits on the first "/" without requiring
+      # any external tools.
       # -----------------------------------------------------------------------
-      - name: Extract repo owner and name
+      - name: Extract target repo owner and name
         id: repo-parts
         run: |
           FULL="${{ matrix.repo.repo }}"
@@ -328,15 +335,15 @@ jobs:
           echo "name=${FULL#*/}"   >> "$GITHUB_OUTPUT"
 
       # -----------------------------------------------------------------------
-      # Step 2: Generate per-repo installation token.
+      # Step 1b: Generate installation token scoped to the TARGET repo.
       #
-      # actions/create-github-app-token@v1 mints an installation token scoped
-      # to the target repo's owner and repository name. This token is used for
-      # all subsequent gh api calls against the target repo (workflow file
-      # listing, content fetching, and workflow dispatch).
+      # Tokens are generated inside the matrix job so they are always fresh
+      # (installation tokens expire after 1 hour). Scoping to the target repo
+      # owner/name ensures the token carries the correct installation context
+      # for dispatching workflows on that repo.
       # -----------------------------------------------------------------------
-      - name: Generate per-repo installation token
-        id: repo-token
+      - name: Generate app token (target repo)
+        id: app-token
         uses: actions/create-github-app-token@v1
         with:
           app-id:      ${{ secrets.APP_ID }}
@@ -345,7 +352,7 @@ jobs:
           repositories: ${{ steps.repo-parts.outputs.name }}
 
       # -----------------------------------------------------------------------
-      # Step 3: Find the caller workflow file in the target repo.
+      # Step 2: Find the caller workflow file in the target repo.
       #
       # Fast path: use matrix.repo.workflow_file if non-empty (populated by
       # discover.yml). Slow path: scan .github/workflows/ for a file that
@@ -358,7 +365,7 @@ jobs:
       - name: Find caller workflow file
         id: find-workflow
         env:
-          GH_TOKEN:      ${{ steps.repo-token.outputs.token }}
+          GH_TOKEN:      ${{ steps.app-token.outputs.token }}
           TARGET_REPO:   ${{ matrix.repo.repo }}
           KNOWN_WF_FILE: ${{ matrix.repo.workflow_file }}
         run: |
@@ -428,7 +435,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # Step 4: Trigger workflow_dispatch on the target repo.
+      # Step 3: Trigger workflow_dispatch on the target repo.
       #
       # Skipped when no matching workflow was found (find-workflow.outputs.found
       # != 'true'). In dry_run mode, logs intent but does not call the API.
@@ -448,7 +455,7 @@ jobs:
         id: trigger
         if: steps.find-workflow.outputs.found == 'true'
         env:
-          GH_TOKEN:      ${{ steps.repo-token.outputs.token }}
+          GH_TOKEN:      ${{ steps.app-token.outputs.token }}
           TARGET_REPO:   ${{ matrix.repo.repo }}
           WORKFLOW_FILE: ${{ steps.find-workflow.outputs.workflow_file }}
           DRY_RUN:       ${{ inputs.dry_run || 'false' }}
@@ -511,7 +518,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # Step 5: Record the per-repo result.
+      # Step 4: Record the per-repo result.
       # Runs always so failures and skips are captured.
       #
       # Output `result` values:
