@@ -7,21 +7,36 @@
 # Those concerns belong to the orchestrator wrapper (repo-task.yml) or to the
 # calling workflow in the target repo.
 #
-# github.repository and github.token are used automatically — no need for the
-# caller to pass repo identity or a token.  When called via workflow_call from
-# a target repo, github.token is automatically scoped to that target repo and
-# has the necessary contents: read and security_events: read permissions.
+# Token strategy:
+#   GHAS API calls use GHAS_TOKEN if provided, otherwise fall back to github.token.
+#
+#   GHAS_TOKEN should be a fine-grained PAT with "Security events: read" permission
+#   scoped to the target repository. It is required for Dependabot alerts because
+#   github.token in a cross-repo workflow_call context cannot access the Dependabot
+#   alerts API (GitHub platform restriction — returns 403 regardless of permissions).
+#
+#   CodeQL and Secret Scanning alerts work with github.token + security-events: read.
+#   Only Dependabot alerts require the fine-grained PAT.
+#
+# Setup for target repos:
+#   1. Create a fine-grained PAT with "Security events: read" scoped to the target repo.
+#   2. Store it as a repo secret named GHAS_TOKEN in the target repo.
+#   3. Pass it explicitly in the caller workflow: secrets: { GHAS_TOKEN: ${{ secrets.GHAS_TOKEN }} }
 #
 # Usage from a target repo:
 #
+#   permissions:
+#     contents: read
+#     security-events: read
+#
 #   jobs:
 #     task:
-#       uses: <orchestrator-org>/repo-task-orchestrator/.github/workflows/repo-task-core.yml@main
+#       uses: <orchestrator-org>/reusable-workflow-playground/.github/workflows/repo-task-core.yml@main
 #       with:
 #         dry_run: 'false'
 #         runner: ubuntu-latest   # optional
 #       secrets:
-#         EXTERNAL_API_KEY: ${{ secrets.EXTERNAL_API_KEY }}   # optional
+#         GHAS_TOKEN: ${{ secrets.GHAS_TOKEN }}   # fine-grained PAT stored in the target repo
 
 name: Repo Task (Core)
 run-name: "repo-task-core/${{ github.repository }}"
@@ -40,6 +55,13 @@ on:
         type: string
         default: 'ubuntu-latest'
     secrets:
+      GHAS_TOKEN:
+        description: >
+          Fine-grained PAT with "Security events: read" scoped to the target repo.
+          Required for Dependabot alerts — github.token cannot access the Dependabot
+          alerts API in a cross-repo workflow_call context (GitHub platform restriction).
+          If not provided, github.token is used (CodeQL and Secret Scanning will still work).
+        required: false
       EXTERNAL_API_KEY:
         description: 'Reserved for future use by an external API (e.g. LLM); not used by the current GHAS task'
         required: false
@@ -83,10 +105,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching CodeQL alerts for $REPO..."
-          gh api "repos/$REPO/code-scanning/alerts?per_page=100&state=open&tool_name=CodeQL" \
-            > codeql-alerts.json 2>/dev/null || echo '[]' > codeql-alerts.json
+          raw=""
+          if raw=$(gh api --paginate \
+              "repos/$REPO/code-scanning/alerts?state=open&tool_name=CodeQL" \
+              2>&1); then
+            echo "$raw" | jq -c '[.[] | {
+              number: .number,
+              rule_id: .rule.id,
+              rule_severity: .rule.severity,
+              rule_description: .rule.description,
+              path: .most_recent_instance.location.path,
+              start_line: .most_recent_instance.location.start_line,
+              html_url: .html_url
+            }]' > codeql-alerts.json
+          else
+            if echo "$raw" | grep -qE '"status":"404"|"status":"403"|HTTP 404|HTTP 403'; then
+              echo "CodeQL not enabled or not licensed for $REPO — writing empty list."
+            else
+              echo "WARNING: Unexpected error fetching CodeQL alerts: $raw"
+            fi
+            echo '[]' > codeql-alerts.json
+          fi
           count=$(jq 'length' codeql-alerts.json)
           echo "CodeQL open alerts: $count"
 
@@ -94,13 +135,48 @@ jobs:
         id: dependabot
         if: inputs.dry_run != 'true'
         env:
-          GH_TOKEN: ${{ github.token }}
+          # Use GHAS_TOKEN (fine-grained PAT) if provided; fall back to github.token.
+          # github.token cannot access Dependabot alerts in cross-repo workflow_call
+          # (GitHub platform restriction — 403 regardless of permissions block).
+          GH_TOKEN: ${{ secrets.GHAS_TOKEN || github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching Dependabot alerts for $REPO..."
-          gh api "repos/$REPO/dependabot/alerts?per_page=100&state=open" \
-            > dependabot-alerts.json 2>/dev/null || echo '[]' > dependabot-alerts.json
+          if [ -n "${{ secrets.GHAS_TOKEN }}" ]; then
+            echo "Using GHAS_TOKEN (fine-grained PAT)."
+          else
+            echo "GHAS_TOKEN not set — using github.token (may return 403 in cross-repo workflow_call)."
+          fi
+          raw=""
+          if raw=$(gh api --paginate \
+              "repos/$REPO/dependabot/alerts?state=open" \
+              2>&1); then
+            echo "$raw" | jq -c '[.[] | {
+              number: .number,
+              ghsa_id: .security_advisory.ghsa_id,
+              cve_id: .security_advisory.cve_id,
+              severity: .security_advisory.severity,
+              summary: .security_advisory.summary,
+              package_ecosystem: .dependency.package.ecosystem,
+              package_name: .dependency.package.name,
+              manifest_path: .dependency.manifest_path,
+              vulnerable_version_range: .security_vulnerability.vulnerable_version_range,
+              first_patched_version: .security_vulnerability.first_patched_version.identifier,
+              html_url: .html_url
+            }]' > dependabot-alerts.json
+          else
+            if echo "$raw" | grep -q '"status":"403"'; then
+              echo "WARNING: 403 fetching Dependabot alerts for $REPO."
+              echo "  Store a fine-grained PAT (Security events: read) as secret GHAS_TOKEN"
+              echo "  in the target repo and use 'secrets: inherit' in the caller workflow."
+            elif echo "$raw" | grep -qE '"status":"404"'; then
+              echo "WARNING: Dependabot not enabled for $REPO (404) — writing empty list."
+            else
+              echo "WARNING: Unexpected error fetching Dependabot alerts: $raw"
+            fi
+            echo '[]' > dependabot-alerts.json
+          fi
           count=$(jq 'length' dependabot-alerts.json)
           echo "Dependabot open alerts: $count"
 
@@ -111,10 +187,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching Secret Scanning alerts for $REPO..."
-          gh api "repos/$REPO/secret-scanning/alerts?per_page=100&state=open" \
-            > secret-scanning-alerts.json 2>/dev/null || echo '[]' > secret-scanning-alerts.json
+          raw=""
+          if raw=$(gh api --paginate \
+              "repos/$REPO/secret-scanning/alerts?state=open" \
+              2>&1); then
+            echo "$raw" > secret-scanning-alerts.json
+          else
+            if echo "$raw" | grep -qE '"status":"404"|"status":"403"|HTTP 404|HTTP 403'; then
+              echo "Secret Scanning not enabled or not licensed for $REPO — writing empty list."
+            else
+              echo "WARNING: Unexpected error fetching Secret Scanning alerts: $raw"
+            fi
+            echo '[]' > secret-scanning-alerts.json
+          fi
           count=$(jq 'length' secret-scanning-alerts.json)
           echo "Secret Scanning open alerts: $count"
 
