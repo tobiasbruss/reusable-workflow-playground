@@ -1,0 +1,162 @@
+# repo-task-core.yml
+#
+# Reusable core task workflow — callable from target repos via workflow_call.
+#
+# This workflow contains the actual task logic (checkout, GHAS findings fetch,
+# artifact upload) without duplicate-run detection or App token minting.
+# Those concerns belong to the orchestrator wrapper (repo-task.yml) or to the
+# calling workflow in the target repo.
+#
+# github.repository and github.token are used automatically — no need for the
+# caller to pass repo identity or a token.  When called via workflow_call from
+# a target repo, github.token is automatically scoped to that target repo and
+# has the necessary contents: read and security_events: read permissions.
+#
+# Usage from a target repo:
+#
+#   jobs:
+#     task:
+#       uses: <orchestrator-org>/repo-task-orchestrator/.github/workflows/repo-task-core.yml@main
+#       with:
+#         dry_run: 'false'
+#         runner: ubuntu-latest   # optional
+#       secrets:
+#         EXTERNAL_API_KEY: ${{ secrets.EXTERNAL_API_KEY }}   # optional
+
+name: Repo Task (Core)
+run-name: "repo-task-core/${{ github.repository }}"
+
+on:
+  workflow_call:
+    inputs:
+      dry_run:
+        description: 'If true, skip side-effects and simulate token usage'
+        required: false
+        type: string
+        default: 'false'
+      runner:
+        description: 'Runner label to use (e.g. ubuntu-latest or arc-task-runner-set)'
+        required: false
+        type: string
+        default: 'ubuntu-latest'
+    secrets:
+      EXTERNAL_API_KEY:
+        description: 'Reserved for future use by an external API (e.g. LLM); not used by the current GHAS task'
+        required: false
+    outputs:
+      status:
+        description: 'Task result: success or failed'
+        value: ${{ jobs.task.outputs.status }}
+      repo:
+        description: 'The repository this workflow ran against'
+        value: ${{ jobs.task.outputs.repo }}
+      tokens_used:
+        description: 'Number of tokens consumed (0 for GHAS tasks; simulated for dry_run)'
+        value: ${{ jobs.task.outputs.tokens_used }}
+
+jobs:
+  task:
+    runs-on: ${{ inputs.runner }}
+    outputs:
+      status: ${{ steps.status.outputs.result }}
+      repo: ${{ github.repository }}
+      tokens_used: ${{ steps.write-output.outputs.tokens_used }}
+    steps:
+      - name: Extract repo owner and name
+        id: repo-parts
+        run: |
+          echo "owner=${REPO%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${REPO##*/}"  >> "$GITHUB_OUTPUT"
+        env:
+          REPO: ${{ github.repository }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ github.repository }}
+          ref: main
+
+      - name: Fetch GHAS findings — CodeQL alerts
+        id: codeql
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          echo "Fetching CodeQL alerts for $REPO..."
+          gh api "repos/$REPO/code-scanning/alerts?per_page=100&state=open&tool_name=CodeQL" \
+            > codeql-alerts.json 2>/dev/null || echo '[]' > codeql-alerts.json
+          count=$(jq 'length' codeql-alerts.json)
+          echo "CodeQL open alerts: $count"
+
+      - name: Fetch GHAS findings — Dependabot alerts
+        id: dependabot
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          echo "Fetching Dependabot alerts for $REPO..."
+          gh api "repos/$REPO/dependabot/alerts?per_page=100&state=open" \
+            > dependabot-alerts.json 2>/dev/null || echo '[]' > dependabot-alerts.json
+          count=$(jq 'length' dependabot-alerts.json)
+          echo "Dependabot open alerts: $count"
+
+      - name: Fetch GHAS findings — Secret Scanning alerts
+        id: secret-scanning
+        if: inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -e
+          echo "Fetching Secret Scanning alerts for $REPO..."
+          gh api "repos/$REPO/secret-scanning/alerts?per_page=100&state=open" \
+            > secret-scanning-alerts.json 2>/dev/null || echo '[]' > secret-scanning-alerts.json
+          count=$(jq 'length' secret-scanning-alerts.json)
+          echo "Secret Scanning open alerts: $count"
+
+      - name: Sanitize artifact name
+        id: artifact-name
+        run: |
+          # Replace slashes and other characters that are invalid in artifact names
+          safe_repo=$(echo "${{ github.repository }}" | tr '/' '-' | tr -cd '[:alnum:]-_.')
+          echo "value=ghas-findings-${safe_repo}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload GHAS findings artifact
+        if: inputs.dry_run != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.artifact-name.outputs.value }}
+          path: |
+            codeql-alerts.json
+            dependabot-alerts.json
+            secret-scanning-alerts.json
+          if-no-files-found: warn
+          retention-days: 30
+
+      - name: Mark status
+        id: status
+        if: always()
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+          else
+            echo "result=failed" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Write task output
+        id: write-output
+        run: |
+          if [ "${{ inputs.dry_run }}" == "true" ]; then
+            # Simulate token usage for dry_run mode
+            tokens_used=$((RANDOM % 5000 + 500))
+            echo "dry_run=true — simulated tokens used: $tokens_used"
+          else
+            # GHAS fetch tasks do not consume LLM tokens
+            tokens_used=0
+            echo "tokens_used=0 (GHAS task — no LLM calls)"
+          fi
+          echo "tokens_used=$tokens_used" >> "$GITHUB_OUTPUT"
