@@ -93,12 +93,22 @@ jobs:
         run: |
           set -euo pipefail
 
-          installations=$(curl -sf \
+          # Fetch installations — fail loudly on non-200 so JWT errors surface
+          INSTALL_RESPONSE=$(curl -s -w "\n%{http_code}" \
             -H "Authorization: Bearer $APP_JWT" \
             -H "Accept: application/vnd.github+json" \
-            "https://api.github.com/app/installations" \
-            | jq -c '[.[].id]' || echo "[]")
+            "https://api.github.com/app/installations")
+          INSTALL_HTTP=$(echo "$INSTALL_RESPONSE" | tail -1)
+          INSTALL_BODY=$(echo "$INSTALL_RESPONSE" | head -n -1)
 
+          if [ "$INSTALL_HTTP" != "200" ]; then
+            echo "ERROR: Failed to fetch installations (HTTP ${INSTALL_HTTP})"
+            echo "Response: ${INSTALL_BODY}"
+            echo "Ensure APP_ID and APP_PRIVATE_KEY secrets are from the same GitHub App."
+            exit 1
+          fi
+
+          installations=$(echo "$INSTALL_BODY" | jq -c '[.[].id]')
           echo "Found installations: $installations"
 
           all_repos="[]"

@@ -7,21 +7,27 @@
 # Those concerns belong to the orchestrator wrapper (repo-task.yml) or to the
 # calling workflow in the target repo.
 #
-# github.repository and github.token are used automatically — no need for the
-# caller to pass repo identity or a token.  When called via workflow_call from
-# a target repo, github.token is automatically scoped to that target repo and
-# has the necessary contents: read and security_events: read permissions.
+# Token strategy:
+#   All GHAS API calls use github.token, which is automatically scoped to the
+#   target repo when called via workflow_call from that repo.
+#
+#   The caller must grant:
+#     permissions:
+#       contents: read
+#       security-events: read
 #
 # Usage from a target repo:
 #
+#   permissions:
+#     contents: read
+#     security-events: read
+#
 #   jobs:
 #     task:
-#       uses: <orchestrator-org>/repo-task-orchestrator/.github/workflows/repo-task-core.yml@main
+#       uses: <orchestrator-org>/reusable-workflow-playground/.github/workflows/repo-task-core.yml@main
 #       with:
 #         dry_run: 'false'
 #         runner: ubuntu-latest   # optional
-#       secrets:
-#         EXTERNAL_API_KEY: ${{ secrets.EXTERNAL_API_KEY }}   # optional
 
 name: Repo Task (Core)
 run-name: "repo-task-core/${{ github.repository }}"
@@ -57,6 +63,9 @@ on:
 jobs:
   task:
     runs-on: ${{ inputs.runner }}
+    permissions:
+      contents: read
+      security-events: read
     outputs:
       status: ${{ steps.status.outputs.result }}
       repo: ${{ github.repository }}
@@ -83,10 +92,29 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching CodeQL alerts for $REPO..."
-          gh api "repos/$REPO/code-scanning/alerts?per_page=100&state=open&tool_name=CodeQL" \
-            > codeql-alerts.json 2>/dev/null || echo '[]' > codeql-alerts.json
+          raw=""
+          if raw=$(gh api --paginate \
+              "repos/$REPO/code-scanning/alerts?state=open&tool_name=CodeQL" \
+              2>&1); then
+            echo "$raw" | jq -c '[.[] | {
+              number: .number,
+              rule_id: .rule.id,
+              rule_severity: .rule.severity,
+              rule_description: .rule.description,
+              path: .most_recent_instance.location.path,
+              start_line: .most_recent_instance.location.start_line,
+              html_url: .html_url
+            }]' > codeql-alerts.json
+          else
+            if echo "$raw" | grep -qE '"status":"404"|"status":"403"|HTTP 404|HTTP 403'; then
+              echo "CodeQL not enabled or not licensed for $REPO — writing empty list."
+            else
+              echo "WARNING: Unexpected error fetching CodeQL alerts: $raw"
+            fi
+            echo '[]' > codeql-alerts.json
+          fi
           count=$(jq 'length' codeql-alerts.json)
           echo "CodeQL open alerts: $count"
 
@@ -97,10 +125,36 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching Dependabot alerts for $REPO..."
-          gh api "repos/$REPO/dependabot/alerts?per_page=100&state=open" \
-            > dependabot-alerts.json 2>/dev/null || echo '[]' > dependabot-alerts.json
+          # Use curl with explicit status capture to see the exact response
+          RESPONSE=$(curl -s -w "\n%{http_code}" \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            "https://api.github.com/repos/$REPO/dependabot/alerts?state=open&per_page=100")
+          HTTP=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | head -n -1)
+          echo "HTTP status: $HTTP"
+          echo "Response: $BODY"
+          if [ "$HTTP" = "200" ]; then
+            echo "$BODY" | jq -c '[.[] | {
+              number: .number,
+              ghsa_id: .security_advisory.ghsa_id,
+              cve_id: .security_advisory.cve_id,
+              severity: .security_advisory.severity,
+              summary: .security_advisory.summary,
+              package_ecosystem: .dependency.package.ecosystem,
+              package_name: .dependency.package.name,
+              manifest_path: .dependency.manifest_path,
+              vulnerable_version_range: .security_vulnerability.vulnerable_version_range,
+              first_patched_version: .security_vulnerability.first_patched_version.identifier,
+              html_url: .html_url
+            }]' > dependabot-alerts.json
+          else
+            echo "WARNING: HTTP $HTTP fetching Dependabot alerts — writing empty list."
+            echo '[]' > dependabot-alerts.json
+          fi
           count=$(jq 'length' dependabot-alerts.json)
           echo "Dependabot open alerts: $count"
 
@@ -111,10 +165,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
         run: |
-          set -e
+          set -euo pipefail
           echo "Fetching Secret Scanning alerts for $REPO..."
-          gh api "repos/$REPO/secret-scanning/alerts?per_page=100&state=open" \
-            > secret-scanning-alerts.json 2>/dev/null || echo '[]' > secret-scanning-alerts.json
+          raw=""
+          if raw=$(gh api --paginate \
+              "repos/$REPO/secret-scanning/alerts?state=open" \
+              2>&1); then
+            echo "$raw" > secret-scanning-alerts.json
+          else
+            if echo "$raw" | grep -qE '"status":"404"|"status":"403"|HTTP 404|HTTP 403'; then
+              echo "Secret Scanning not enabled or not licensed for $REPO — writing empty list."
+            else
+              echo "WARNING: Unexpected error fetching Secret Scanning alerts: $raw"
+            fi
+            echo '[]' > secret-scanning-alerts.json
+          fi
           count=$(jq 'length' secret-scanning-alerts.json)
           echo "Secret Scanning open alerts: $count"
 

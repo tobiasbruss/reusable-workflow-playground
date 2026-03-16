@@ -7,12 +7,10 @@
 # references repo-task-core.yml via `uses:`).
 #
 # Token strategy:
-#   - All jobs: actions/create-github-app-token@v1 scoped to the orchestrator
-#     repo (repositories: ${{ github.event.repository.name }}). This produces
-#     an installation token for the orchestrator's installation, which is used
-#     for all gh api / curl calls including dispatching to target repos.
-#   - Manual JWT generation is NOT needed here — it is only required in
-#     discover.yml for App-level endpoints (GET /app/installations).
+#   - prepare job: actions/create-github-app-token@v1 scoped to the orchestrator
+#     repo for artifact download API calls.
+#   - dispatch job: actions/create-github-app-token@v1 scoped to each target
+#     repo's owner/name for workflow dispatch on that repo.
 #
 # Triggers:
 #   - workflow_run: automatically after "Repository Discovery" completes successfully
@@ -445,7 +443,8 @@ jobs:
       #
       # NOTE: The target caller workflow MUST declare `on: workflow_dispatch`
       # for this API call to succeed. A 422 response indicates the workflow
-      # does not have workflow_dispatch enabled.
+      # does not have workflow_dispatch enabled, or the inputs payload contains
+      # fields not declared by the target workflow.
       #
       # Outputs:
       #   triggered   — "true" / "false"
@@ -459,19 +458,16 @@ jobs:
           TARGET_REPO:   ${{ matrix.repo.repo }}
           WORKFLOW_FILE: ${{ steps.find-workflow.outputs.workflow_file }}
           DRY_RUN:       ${{ inputs.dry_run || 'false' }}
-          RUNNER_LABEL:  ${{ inputs.runner || 'ubuntu-latest' }}
         run: |
           set -euo pipefail
 
           DISPATCH_PAYLOAD=$(jq -cn \
             --arg ref     "main" \
             --arg dry_run "${DRY_RUN}" \
-            --arg runner  "${RUNNER_LABEL}" \
             '{
               ref: $ref,
               inputs: {
-                dry_run: $dry_run,
-                runner:  $runner
+                dry_run: $dry_run
               }
             }')
 
@@ -494,7 +490,7 @@ jobs:
           # ------------------------------------------------------------------
           # Live dispatch: POST to the workflow dispatches endpoint
           # ------------------------------------------------------------------
-          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+          HTTP_STATUS=$(curl -s -o /tmp/dispatch-response.json -w "%{http_code}" \
             -X POST \
             -H "Authorization: Bearer ${GH_TOKEN}" \
             -H "Accept: application/vnd.github+json" \
@@ -512,6 +508,8 @@ jobs:
             echo "triggered=true" >> "$GITHUB_OUTPUT"
           else
             echo "❌ Dispatch failed for ${TARGET_REPO} (HTTP ${HTTP_STATUS})"
+            echo "Response body:"
+            cat /tmp/dispatch-response.json 2>/dev/null || echo "(empty)"
             echo "triggered=false" >> "$GITHUB_OUTPUT"
             # Exit non-zero so the matrix job is marked as failed
             exit 1
