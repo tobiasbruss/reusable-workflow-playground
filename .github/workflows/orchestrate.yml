@@ -1,0 +1,630 @@
+# orchestrate.yml
+#
+# Orchestration / Trigger Workflow
+#
+# Takes the list of eligible repositories produced by discover.yml and triggers
+# `workflow_dispatch` on each target repo's caller workflow (the one that
+# references repo-task-core.yml via `uses:`).
+#
+# Token strategy:
+#   - prepare job: uses actions/create-github-app-token@v1 scoped to the
+#     orchestrator repo for artifact download API calls.
+#   - dispatch job: uses actions/create-github-app-token@v1 scoped to each
+#     target repo's owner/name for per-repo workflow dispatch.
+#
+# Triggers:
+#   - workflow_run: automatically after "Repository Discovery" completes successfully
+#   - workflow_dispatch: manual trigger with optional repo_list override
+#
+# NOTE: Target caller workflows MUST declare `on: workflow_dispatch` in their
+# triggers for the dispatch step to succeed. Workflows that do not expose
+# workflow_dispatch will receive a 422 response and be marked as failed.
+
+name: Orchestrate Repository Dispatches
+
+on:
+  # Automatically triggered when discover.yml completes.
+  # Only proceeds when the triggering run concluded successfully (checked in
+  # the `prepare` job's `if:` condition below).
+  workflow_run:
+    workflows: ["Repository Discovery"]
+    types: [completed]
+
+  # Manual trigger — optionally supply a JSON repo list to skip artifact download.
+  workflow_dispatch:
+    inputs:
+      repo_list:
+        description: >
+          JSON array of repo objects to target, e.g.
+          [{"repo":"org/repo1","workflow_file":"scan.yml"}].
+          If empty, the latest eligible-repos artifact from the most recent
+          Repository Discovery run is used instead.
+        type: string
+        required: false
+        default: ''
+      dry_run:
+        description: 'Pass dry_run=true to each target workflow (no actual changes)'
+        type: boolean
+        required: false
+        default: false
+      runner:
+        description: 'Runner label to pass through to target workflows'
+        type: string
+        required: false
+        default: 'ubuntu-latest'
+
+# Minimal permissions for the workflow's own github.token.
+# All cross-repo operations use the GitHub App installation token instead.
+permissions:
+  contents: read
+  actions: read
+
+# ---------------------------------------------------------------------------
+# Job 1: prepare
+#
+# Resolves the list of repos to target and builds the dispatch matrix.
+# Runs when triggered manually OR when the upstream discover run succeeded.
+# ---------------------------------------------------------------------------
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+
+    # Skip if triggered by workflow_run but the upstream run did not succeed.
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.workflow_run.conclusion == 'success'
+
+    outputs:
+      matrix:         ${{ steps.resolve-repos.outputs.matrix }}
+      eligible_count: ${{ steps.resolve-repos.outputs.eligible_count }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Generate installation token scoped to THIS (orchestrator) repo.
+      # Used for artifact download API calls scoped to this repo/org.
+      # -----------------------------------------------------------------------
+      - name: Generate app token (orchestrator repo)
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id:      ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+
+      # -----------------------------------------------------------------------
+      # Step 2: Resolve the repo list into a matrix JSON object.
+      #
+      # Priority order:
+      #   A) workflow_dispatch with non-empty repo_list input → parse directly
+      #   B) workflow_run trigger → download eligible-repos artifact from the
+      #      triggering run ID (github.event.workflow_run.id)
+      #   C) workflow_dispatch without repo_list → find latest successful
+      #      Repository Discovery run via API and download its artifact
+      #
+      # Output matrix shape:
+      #   {"repo": [{"repo":"org/name","workflow_file":"scan.yml"}, ...]}
+      #
+      # The eligible-repos.json artifact from discover.yml already uses this
+      # shape, so it can be used directly.
+      # -----------------------------------------------------------------------
+      - name: Resolve repo list and build matrix
+        id: resolve-repos
+        env:
+          GH_TOKEN:          ${{ steps.app-token.outputs.token }}
+          REPO_LIST:         ${{ inputs.repo_list }}
+          EVENT_NAME:        ${{ github.event_name }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          CURRENT_REPO:      ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          MATRIX='{"repo":[]}'
+          ELIGIBLE_COUNT=0
+
+          # ------------------------------------------------------------------
+          # Path A: manual dispatch with an explicit repo_list provided
+          # ------------------------------------------------------------------
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && [ -n "${REPO_LIST}" ]; then
+            echo "Source: workflow_dispatch with explicit repo_list input"
+
+            if ! echo "${REPO_LIST}" | jq -e 'if type == "array" then . else error("not an array") end' > /dev/null 2>&1; then
+              echo "ERROR: repo_list input is not a valid JSON array."
+              echo "  Received: ${REPO_LIST}"
+              exit 1
+            fi
+
+            # Normalise: convert plain strings to objects; pass objects through
+            REPO_ARRAY=$(echo "${REPO_LIST}" | jq -c '
+              map(
+                if type == "string" then
+                  {"repo": ., "workflow_file": ""}
+                else
+                  .
+                end
+              )
+            ')
+
+            ELIGIBLE_COUNT=$(echo "${REPO_ARRAY}" | jq 'length')
+            MATRIX=$(echo "${REPO_ARRAY}" | jq -c '{repo: .}')
+
+          # ------------------------------------------------------------------
+          # Path B / C: workflow_run trigger OR manual dispatch without repo_list
+          #             → download the eligible-repos artifact
+          # ------------------------------------------------------------------
+          else
+            if [ "${EVENT_NAME}" = "workflow_run" ]; then
+              echo "Source: workflow_run trigger (run ID: ${TRIGGERING_RUN_ID})"
+              RUN_ID="${TRIGGERING_RUN_ID}"
+            else
+              echo "Source: workflow_dispatch (no repo_list) — finding latest Repository Discovery run"
+
+              DISCOVER_WF_ID=$(gh api \
+                "/repos/${CURRENT_REPO}/actions/workflows" \
+                --paginate \
+                --jq '.workflows[] | select(.name == "Repository Discovery") | .id' \
+                | head -1)
+
+              if [ -z "${DISCOVER_WF_ID}" ]; then
+                echo "ERROR: Could not find a workflow named 'Repository Discovery' in ${CURRENT_REPO}."
+                echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+                echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              echo "Found Repository Discovery workflow ID: ${DISCOVER_WF_ID}"
+
+              RUN_ID=$(gh api \
+                "/repos/${CURRENT_REPO}/actions/workflows/${DISCOVER_WF_ID}/runs" \
+                --field status=success \
+                --field per_page=1 \
+                --jq '.workflow_runs[0].id')
+
+              if [ -z "${RUN_ID}" ] || [ "${RUN_ID}" = "null" ]; then
+                echo "WARNING: No successful Repository Discovery run found. Cannot resolve repo list."
+                echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+                echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+
+              echo "Using Repository Discovery run ID: ${RUN_ID}"
+            fi
+
+            # Download the eligible-repos artifact from the resolved run
+            echo "Downloading eligible-repos artifact from run ${RUN_ID}..."
+
+            ARTIFACT_ID=$(gh api \
+              "/repos/${CURRENT_REPO}/actions/runs/${RUN_ID}/artifacts" \
+              --jq '.artifacts[] | select(.name == "eligible-repos") | .id' \
+              | head -1)
+
+            if [ -z "${ARTIFACT_ID}" ] || [ "${ARTIFACT_ID}" = "null" ]; then
+              echo "WARNING: No 'eligible-repos' artifact found in run ${RUN_ID}."
+              echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+              echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Found artifact ID: ${ARTIFACT_ID}"
+
+            gh api \
+              "/repos/${CURRENT_REPO}/actions/artifacts/${ARTIFACT_ID}/zip" \
+              --header "Accept: application/vnd.github+json" \
+              > /tmp/eligible-repos.zip
+
+            unzip -o /tmp/eligible-repos.zip -d /tmp/eligible-repos-artifact/
+            ARTIFACT_JSON="/tmp/eligible-repos-artifact/eligible-repos.json"
+
+            if [ ! -f "${ARTIFACT_JSON}" ]; then
+              echo "WARNING: eligible-repos.json not found inside the artifact archive."
+              echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+              echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Artifact contents:"
+            cat "${ARTIFACT_JSON}"
+
+            # The artifact already contains the matrix shape: {"repo": [...]}
+            if jq -e '.repo | type == "array"' "${ARTIFACT_JSON}" > /dev/null 2>&1; then
+              MATRIX=$(jq -c '.' "${ARTIFACT_JSON}")
+              ELIGIBLE_COUNT=$(jq '.repo | length' "${ARTIFACT_JSON}")
+            else
+              echo "WARNING: Unexpected artifact format. Expected {\"repo\":[...]}."
+              echo "  Got: $(cat "${ARTIFACT_JSON}")"
+            fi
+          fi
+
+          # ------------------------------------------------------------------
+          # Emit outputs
+          # ------------------------------------------------------------------
+          echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+          echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+
+          echo "---"
+          echo "Resolved matrix: ${MATRIX}"
+          echo "Eligible repo count: ${ELIGIBLE_COUNT}"
+
+      # -----------------------------------------------------------------------
+      # Step 3: Write a job summary for the prepare phase.
+      # -----------------------------------------------------------------------
+      - name: Write prepare summary
+        if: always()
+        env:
+          EVENT_NAME:     ${{ github.event_name }}
+          DRY_RUN:        ${{ inputs.dry_run || 'false' }}
+          ELIGIBLE_COUNT: ${{ steps.resolve-repos.outputs.eligible_count || '0' }}
+          MATRIX:         ${{ steps.resolve-repos.outputs.matrix || '{"repo":[]}' }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "## 🚀 Orchestration — Prepare Phase"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+
+            if [ "${EVENT_NAME}" = "workflow_run" ]; then
+              echo "| Trigger | \`workflow_run\` (after Repository Discovery) |"
+            else
+              echo "| Trigger | \`workflow_dispatch\` (manual) |"
+            fi
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "| Dry-run mode | ✅ **Enabled** — no actual dispatches will be sent |"
+            else
+              echo "| Dry-run mode | ❌ Disabled — live dispatches will be sent |"
+            fi
+
+            echo "| Repos to process | **${ELIGIBLE_COUNT}** |"
+            echo ""
+
+            if [ "${ELIGIBLE_COUNT}" -gt 0 ]; then
+              echo "### 📋 Target Repositories"
+              echo ""
+              echo "| Repository | Workflow File |"
+              echo "|------------|---------------|"
+              echo "${MATRIX}" | jq -r '
+                .repo[] |
+                "| `\(.repo)` | `\(if .workflow_file != "" then .workflow_file else "(to be detected)" end)` |"
+              '
+            else
+              echo "### ℹ️ No repositories to process"
+              echo ""
+              echo "The resolved repo list is empty. Check the Repository Discovery run or the \`repo_list\` input."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ---------------------------------------------------------------------------
+# Job 2: dispatch
+#
+# Matrix job — one runner per target repo.
+# Uses actions/create-github-app-token@v1 to mint a per-repo installation
+# token scoped to the target repo, then finds the caller workflow file and
+# triggers workflow_dispatch.
+# ---------------------------------------------------------------------------
+  dispatch:
+    runs-on: ubuntu-latest
+    needs: prepare
+
+    # Only run if there are repos to process
+    if: needs.prepare.outputs.eligible_count > 0
+
+    strategy:
+      # Limit concurrent dispatches to avoid secondary rate limits.
+      max-parallel: 5
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Extract owner and repo name from the matrix entry.
+      # Required so actions/create-github-app-token@v1 can be scoped correctly.
+      # -----------------------------------------------------------------------
+      - name: Extract repo owner and name
+        id: repo-parts
+        run: |
+          FULL="${{ matrix.repo.repo }}"
+          echo "owner=${FULL%%/*}" >> "$GITHUB_OUTPUT"
+          echo "name=${FULL#*/}"   >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 2: Generate per-repo installation token.
+      #
+      # actions/create-github-app-token@v1 mints an installation token scoped
+      # to the target repo's owner and repository name. This token is used for
+      # all subsequent gh api calls against the target repo (workflow file
+      # listing, content fetching, and workflow dispatch).
+      # -----------------------------------------------------------------------
+      - name: Generate per-repo installation token
+        id: repo-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id:      ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner:       ${{ steps.repo-parts.outputs.owner }}
+          repositories: ${{ steps.repo-parts.outputs.name }}
+
+      # -----------------------------------------------------------------------
+      # Step 3: Find the caller workflow file in the target repo.
+      #
+      # Fast path: use matrix.repo.workflow_file if non-empty (populated by
+      # discover.yml). Slow path: scan .github/workflows/ for a file that
+      # references repo-task-core.yml.
+      #
+      # Outputs:
+      #   found         — "true" / "false"
+      #   workflow_file — filename (e.g. "ghas-scan.yml") or empty string
+      # -----------------------------------------------------------------------
+      - name: Find caller workflow file
+        id: find-workflow
+        env:
+          GH_TOKEN:      ${{ steps.repo-token.outputs.token }}
+          TARGET_REPO:   ${{ matrix.repo.repo }}
+          KNOWN_WF_FILE: ${{ matrix.repo.workflow_file }}
+        run: |
+          set -euo pipefail
+
+          PATTERN='uses:[[:space:]]+[^/]+/reusable-workflow-playground/\.github/workflows/repo-task-core\.yml'
+
+          # ------------------------------------------------------------------
+          # Fast path: workflow_file already known from discover.yml output
+          # ------------------------------------------------------------------
+          if [ -n "${KNOWN_WF_FILE}" ]; then
+            echo "Workflow file already known from matrix: ${KNOWN_WF_FILE}"
+            echo "workflow_file=${KNOWN_WF_FILE}" >> "$GITHUB_OUTPUT"
+            echo "found=true"                     >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------------
+          # Slow path: scan .github/workflows/ for the reference pattern
+          # ------------------------------------------------------------------
+          echo "No workflow_file in matrix entry — scanning ${TARGET_REPO}/.github/workflows/"
+
+          WORKFLOW_FILES=$(gh api \
+            "repos/${TARGET_REPO}/contents/.github/workflows" \
+            --jq '.[] | select(.type == "file") | select(.name | test("\\.(yml|yaml)$")) | .name' \
+            2>/dev/null) || {
+              echo "WARNING: Could not list .github/workflows/ for ${TARGET_REPO} (no access or directory missing)."
+              echo "workflow_file=" >> "$GITHUB_OUTPUT"
+              echo "found=false"   >> "$GITHUB_OUTPUT"
+              exit 0
+            }
+
+          if [ -z "${WORKFLOW_FILES}" ]; then
+            echo "No YAML workflow files found in ${TARGET_REPO}."
+            echo "workflow_file=" >> "$GITHUB_OUTPUT"
+            echo "found=false"   >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          MATCHED_FILE=""
+          while IFS= read -r WF_FILE; do
+            [ -z "${WF_FILE}" ] && continue
+            echo "  Inspecting ${WF_FILE}..."
+
+            FILE_CONTENT=$(gh api \
+              "repos/${TARGET_REPO}/contents/.github/workflows/${WF_FILE}" \
+              --jq '.content' \
+              2>/dev/null | base64 --decode 2>/dev/null) || {
+                echo "  ⚠ Could not fetch ${WF_FILE}, skipping."
+                continue
+              }
+
+            if echo "${FILE_CONTENT}" | grep -qE "${PATTERN}"; then
+              echo "  ✓ Match found in ${WF_FILE}"
+              MATCHED_FILE="${WF_FILE}"
+              break
+            fi
+          done <<< "${WORKFLOW_FILES}"
+
+          if [ -n "${MATCHED_FILE}" ]; then
+            echo "workflow_file=${MATCHED_FILE}" >> "$GITHUB_OUTPUT"
+            echo "found=true"                   >> "$GITHUB_OUTPUT"
+          else
+            echo "No workflow referencing repo-task-core.yml found in ${TARGET_REPO}."
+            echo "workflow_file=" >> "$GITHUB_OUTPUT"
+            echo "found=false"   >> "$GITHUB_OUTPUT"
+          fi
+
+      # -----------------------------------------------------------------------
+      # Step 4: Trigger workflow_dispatch on the target repo.
+      #
+      # Skipped when no matching workflow was found (find-workflow.outputs.found
+      # != 'true'). In dry_run mode, logs intent but does not call the API.
+      #
+      # The dispatch targets the default branch ("main"). Adjust the `ref` value
+      # if target repos use a different default branch name.
+      #
+      # NOTE: The target caller workflow MUST declare `on: workflow_dispatch`
+      # for this API call to succeed. A 422 response indicates the workflow
+      # does not have workflow_dispatch enabled.
+      #
+      # Outputs:
+      #   triggered   — "true" / "false"
+      #   status_code — HTTP response code from the dispatch API call
+      # -----------------------------------------------------------------------
+      - name: Trigger workflow_dispatch on target repo
+        id: trigger
+        if: steps.find-workflow.outputs.found == 'true'
+        env:
+          GH_TOKEN:      ${{ steps.repo-token.outputs.token }}
+          TARGET_REPO:   ${{ matrix.repo.repo }}
+          WORKFLOW_FILE: ${{ steps.find-workflow.outputs.workflow_file }}
+          DRY_RUN:       ${{ inputs.dry_run || 'false' }}
+          RUNNER_LABEL:  ${{ inputs.runner || 'ubuntu-latest' }}
+        run: |
+          set -euo pipefail
+
+          DISPATCH_PAYLOAD=$(jq -cn \
+            --arg ref     "main" \
+            --arg dry_run "${DRY_RUN}" \
+            --arg runner  "${RUNNER_LABEL}" \
+            '{
+              ref: $ref,
+              inputs: {
+                dry_run: $dry_run,
+                runner:  $runner
+              }
+            }')
+
+          echo "Target repo   : ${TARGET_REPO}"
+          echo "Workflow file : ${WORKFLOW_FILE}"
+          echo "Dry-run mode  : ${DRY_RUN}"
+          echo "Dispatch payload:"
+          echo "${DISPATCH_PAYLOAD}" | jq '.'
+
+          # ------------------------------------------------------------------
+          # Dry-run: log intent and exit without calling the API
+          # ------------------------------------------------------------------
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "DRY RUN — skipping actual dispatch for ${TARGET_REPO}/${WORKFLOW_FILE}"
+            echo "triggered=false"  >> "$GITHUB_OUTPUT"
+            echo "status_code=000"  >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # ------------------------------------------------------------------
+          # Live dispatch: POST to the workflow dispatches endpoint
+          # ------------------------------------------------------------------
+          HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${TARGET_REPO}/actions/workflows/${WORKFLOW_FILE}/dispatches" \
+            -d "${DISPATCH_PAYLOAD}")
+
+          echo "HTTP status: ${HTTP_STATUS}"
+          echo "status_code=${HTTP_STATUS}" >> "$GITHUB_OUTPUT"
+
+          # 204 No Content = success
+          if [ "${HTTP_STATUS}" = "204" ]; then
+            echo "✅ Successfully triggered ${WORKFLOW_FILE} on ${TARGET_REPO}"
+            echo "triggered=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "❌ Dispatch failed for ${TARGET_REPO} (HTTP ${HTTP_STATUS})"
+            echo "triggered=false" >> "$GITHUB_OUTPUT"
+            # Exit non-zero so the matrix job is marked as failed
+            exit 1
+          fi
+
+      # -----------------------------------------------------------------------
+      # Step 5: Record the per-repo result.
+      # Runs always so failures and skips are captured.
+      #
+      # Output `result` values:
+      #   triggered — dispatch API returned 204
+      #   skipped   — no matching workflow found in the target repo
+      #   dry_run   — dry_run mode was active; dispatch was intentionally skipped
+      #   failed    — dispatch API returned a non-204 status
+      # -----------------------------------------------------------------------
+      - name: Record dispatch result
+        id: record-result
+        if: always()
+        env:
+          TARGET_REPO:   ${{ matrix.repo.repo }}
+          WORKFLOW_FILE: ${{ steps.find-workflow.outputs.workflow_file }}
+          FOUND:         ${{ steps.find-workflow.outputs.found }}
+          TRIGGERED:     ${{ steps.trigger.outputs.triggered }}
+          STATUS_CODE:   ${{ steps.trigger.outputs.status_code }}
+          DRY_RUN:       ${{ inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${FOUND}" != "true" ]; then
+            RESULT="skipped"
+          elif [ "${DRY_RUN}" = "true" ]; then
+            RESULT="dry_run"
+          elif [ "${TRIGGERED}" = "true" ]; then
+            RESULT="triggered"
+          else
+            RESULT="failed"
+          fi
+
+          echo "result=${RESULT}" >> "$GITHUB_OUTPUT"
+
+          echo "---"
+          echo "Repo          : ${TARGET_REPO}"
+          echo "Workflow file : ${WORKFLOW_FILE:-N/A}"
+          echo "Result        : ${RESULT}"
+          echo "HTTP status   : ${STATUS_CODE:-N/A}"
+
+# ---------------------------------------------------------------------------
+# Job 3: report
+#
+# Writes a final Markdown summary of all dispatch results.
+# Runs even if the dispatch job failed (fail-fast: false means individual
+# matrix entries may fail while others succeed).
+# ---------------------------------------------------------------------------
+  report:
+    runs-on: ubuntu-latest
+    needs: [prepare, dispatch]
+
+    # Run whenever there were repos to process, regardless of dispatch outcome
+    if: always() && needs.prepare.outputs.eligible_count > 0
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Write a summary table showing the overall dispatch outcome.
+      #
+      # Because GitHub Actions does not natively aggregate per-matrix-entry
+      # outputs, this summary reports the overall matrix job conclusion and
+      # lists all targeted repos (from the prepare matrix). Individual per-repo
+      # results are visible in each matrix job's step logs.
+      # -----------------------------------------------------------------------
+      - name: Write dispatch report summary
+        env:
+          MATRIX:          ${{ needs.prepare.outputs.matrix }}
+          ELIGIBLE_COUNT:  ${{ needs.prepare.outputs.eligible_count }}
+          DISPATCH_RESULT: ${{ needs.dispatch.result }}
+          DRY_RUN:         ${{ inputs.dry_run || 'false' }}
+          RUNNER_LABEL:    ${{ inputs.runner || 'ubuntu-latest' }}
+          RUN_URL:         ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          # Map overall matrix result to an emoji badge
+          case "${DISPATCH_RESULT}" in
+            success)   BADGE="✅ success"   ;;
+            failure)   BADGE="❌ failure"   ;;
+            cancelled) BADGE="⚠️ cancelled" ;;
+            skipped)   BADGE="⏭️ skipped"   ;;
+            *)         BADGE="❓ ${DISPATCH_RESULT}" ;;
+          esac
+
+          {
+            echo "## 📊 Orchestration — Dispatch Report"
+            echo ""
+            echo "| Setting | Value |"
+            echo "|---------|-------|"
+            echo "| Overall dispatch result | ${BADGE} |"
+            echo "| Repos targeted | **${ELIGIBLE_COUNT}** |"
+
+            if [ "${DRY_RUN}" = "true" ]; then
+              echo "| Dry-run mode | ✅ **Enabled** — no dispatches were sent |"
+            else
+              echo "| Dry-run mode | ❌ Disabled |"
+            fi
+
+            echo "| Runner label passed | \`${RUNNER_LABEL}\` |"
+            echo "| Workflow run | [View run](${RUN_URL}) |"
+            echo ""
+            echo "### 🗂️ Targeted Repositories"
+            echo ""
+            echo "> Individual per-repo results (triggered / skipped / failed) are"
+            echo "> visible in each matrix job's **Record dispatch result** step log."
+            echo ""
+            echo "| Repository | Workflow File |"
+            echo "|------------|---------------|"
+
+            echo "${MATRIX}" | jq -r '
+              .repo[] |
+              "| `\(.repo)` | `\(if .workflow_file != "" then .workflow_file else "(detected at runtime)" end)` |"
+            '
+
+            echo ""
+            echo "---"
+            echo "_Generated at $(date -u '+%Y-%m-%dT%H:%M:%SZ')_"
+          } >> "$GITHUB_STEP_SUMMARY"

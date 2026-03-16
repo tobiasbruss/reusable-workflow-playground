@@ -1,0 +1,382 @@
+# discover.yml
+#
+# Repository Discovery Workflow
+#
+# Discovers all repositories where the GitHub App is installed that contain
+# a caller workflow referencing repo-task-core.yml via `uses:`.
+#
+# Uses manual JWT generation for App-level API calls (GET /app/installations)
+# because actions/create-github-app-token@v1 produces an installation token
+# which cannot authenticate App-level endpoints.
+#
+# Outputs an eligible-repos.json artifact and a job output matrix for use
+# by orchestrate.yml (triggered via workflow_run or workflow_dispatch).
+#
+# Triggers:
+#   - workflow_dispatch: manual trigger (no inputs)
+#   - schedule: daily at 02:00 UTC
+
+name: Repository Discovery
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 2 * * *'
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  discover:
+    runs-on: ubuntu-latest
+
+    outputs:
+      matrix: ${{ steps.build-matrix.outputs.matrix }}
+      eligible_count: ${{ steps.build-matrix.outputs.eligible_count }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # Step 1: Generate App JWT manually.
+      #
+      # App-level endpoints (GET /app/installations, POST /app/installations/
+      # {id}/access_tokens) require a JWT signed with the App's RSA private key.
+      # actions/create-github-app-token@v1 produces an installation token which
+      # cannot authenticate these endpoints — a manually signed JWT is required.
+      #
+      # The JWT is masked immediately after generation so it never appears in
+      # plain text in the logs.
+      # -----------------------------------------------------------------------
+      - name: Generate App JWT
+        id: jwt
+        env:
+          APP_ID: ${{ secrets.APP_ID }}
+          APP_PRIVATE_KEY: ${{ secrets.APP_PRIVATE_KEY }}
+        run: |
+          set -e
+          header=$(echo -n '{"alg":"RS256","typ":"JWT"}' | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          now=$(date +%s)
+          iat=$(( now - 60 ))
+          exp=$(( now + 540 ))
+          payload=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' "$iat" "$exp" "$APP_ID" \
+            | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          signing_input="${header}.${payload}"
+          key_file=$(mktemp /tmp/app-key-XXXXXX.pem)
+          echo "$APP_PRIVATE_KEY" > "$key_file"
+          signature=$(echo -n "$signing_input" \
+            | openssl dgst -sha256 -sign "$key_file" \
+            | base64 | tr -d '=' | tr '/+' '_-' | tr -d '\n')
+          rm -f "$key_file"
+          jwt="${signing_input}.${signature}"
+          echo "::add-mask::$jwt"
+          echo "jwt=$jwt" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 2: Query all App installations and collect full repo names.
+      #
+      # Uses the JWT (Bearer auth) for App-level endpoints:
+      #   GET  /app/installations          → list all installation IDs
+      #   POST /app/installations/{id}/access_tokens → mint per-install token
+      #   GET  /installation/repositories  → list repos for that installation
+      #                                      (via gh api with GH_TOKEN)
+      #
+      # The orchestrator repo itself ($GITHUB_REPOSITORY) is excluded from the
+      # output list since it is the workflow host, not a target.
+      #
+      # Writes all discovered repo full names (one per line) to /tmp/all-repos.txt
+      # and emits total_repos count to $GITHUB_OUTPUT.
+      # -----------------------------------------------------------------------
+      - name: List all repositories across all App installations
+        id: list-repos
+        env:
+          APP_JWT: ${{ steps.jwt.outputs.jwt }}
+        run: |
+          set -euo pipefail
+
+          installations=$(curl -sf \
+            -H "Authorization: Bearer $APP_JWT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/app/installations" \
+            | jq -c '[.[].id]' || echo "[]")
+
+          echo "Found installations: $installations"
+
+          all_repos="[]"
+          for install_id in $(echo "$installations" | jq -r '.[]'); do
+            echo "Processing installation ID: ${install_id}"
+
+            install_token=$(curl -sf -X POST \
+              -H "Authorization: Bearer $APP_JWT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/app/installations/${install_id}/access_tokens" \
+              | jq -r '.token' || echo "")
+
+            if [ -z "$install_token" ] || [ "$install_token" = "null" ]; then
+              echo "  ⚠ Could not mint token for installation ${install_id}, skipping."
+              continue
+            fi
+
+            echo "::add-mask::$install_token"
+
+            page=1
+            while true; do
+              batch=$(GH_TOKEN="$install_token" gh api \
+                "installation/repositories?per_page=100&page=${page}" \
+                --jq '[.repositories[].full_name]' 2>/dev/null || echo "[]")
+              count=$(echo "$batch" | jq 'length')
+              if [ "$count" -eq 0 ]; then break; fi
+              all_repos=$(echo "$all_repos" "$batch" | jq -sc 'add // []')
+              if [ "$count" -lt 100 ]; then break; fi
+              page=$(( page + 1 ))
+            done
+          done
+
+          # Exclude the orchestrator repo itself and write one repo per line
+          echo "$all_repos" \
+            | jq -r --arg self "$GITHUB_REPOSITORY" '.[] | select(. != $self)' \
+            > /tmp/all-repos.txt
+
+          TOTAL=$(wc -l < /tmp/all-repos.txt | tr -d ' ')
+          echo "Total repos found (excluding orchestrator): ${TOTAL}"
+          cat /tmp/all-repos.txt
+
+          echo "total_repos=${TOTAL}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 3: Check each repo for a workflow referencing repo-task-core.yml.
+      #
+      # For each repo in /tmp/all-repos.txt:
+      #   1. Resolve its installation ID via GET /repos/{owner}/{repo}/installation
+      #      (uses JWT auth). Installation IDs are cached per owner to avoid
+      #      redundant API calls when multiple repos share the same installation.
+      #   2. Mint a per-installation token.
+      #   3. List .github/workflows/ files via gh api (uses per-install token).
+      #   4. Fetch each .yml/.yaml file and grep for the reusable workflow ref.
+      #   5. On match, append {"repo":"owner/name","workflow_file":"file.yml"}
+      #      to the eligible list.
+      #
+      # Writes eligible-repos.json (matrix shape: {"repo":[...]}) to workspace.
+      # Emits eligible_count to $GITHUB_OUTPUT.
+      # -----------------------------------------------------------------------
+      - name: Check each repo for reusable workflow usage
+        id: check-workflows
+        env:
+          APP_JWT: ${{ steps.jwt.outputs.jwt }}
+        run: |
+          set -euo pipefail
+
+          PATTERN='uses:[[:space:]]+[^/]+/reusable-workflow-playground/\.github/workflows/repo-task-core\.yml'
+
+          TOTAL=0
+          ELIGIBLE=0
+
+          # Associative array: owner → install_id (cache to avoid redundant calls)
+          declare -A OWNER_INSTALL_ID
+          # Associative array: install_id → install_token (cache minted tokens)
+          declare -A INSTALL_TOKEN
+
+          # Start JSON array
+          echo '[' > /tmp/eligible-repos.json
+          FIRST_ENTRY=true
+
+          if [ ! -s /tmp/all-repos.txt ]; then
+            echo "No repositories to check."
+            echo ']' >> /tmp/eligible-repos.json
+            echo "eligible_count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          while IFS= read -r REPO; do
+            [ -z "$REPO" ] && continue
+            TOTAL=$(( TOTAL + 1 ))
+            echo "Checking ${REPO}..."
+
+            OWNER="${REPO%%/*}"
+
+            # ------------------------------------------------------------------
+            # Resolve installation ID (cached per owner)
+            # ------------------------------------------------------------------
+            if [ -n "${OWNER_INSTALL_ID[$OWNER]+x}" ]; then
+              INSTALL_ID="${OWNER_INSTALL_ID[$OWNER]}"
+              echo "  ↳ Using cached installation ID ${INSTALL_ID} for owner ${OWNER}"
+            else
+              INSTALL_ID=$(curl -sf \
+                -H "Authorization: Bearer $APP_JWT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${REPO}/installation" \
+                | jq -r '.id' || echo "")
+
+              if [ -z "$INSTALL_ID" ] || [ "$INSTALL_ID" = "null" ]; then
+                echo "  ⚠ Could not resolve installation ID for ${REPO}, skipping."
+                continue
+              fi
+
+              OWNER_INSTALL_ID[$OWNER]="$INSTALL_ID"
+              echo "  ↳ Resolved installation ID ${INSTALL_ID} for owner ${OWNER}"
+            fi
+
+            # ------------------------------------------------------------------
+            # Mint installation token (cached per install_id)
+            # ------------------------------------------------------------------
+            if [ -n "${INSTALL_TOKEN[$INSTALL_ID]+x}" ]; then
+              REPO_TOKEN="${INSTALL_TOKEN[$INSTALL_ID]}"
+            else
+              REPO_TOKEN=$(curl -sf -X POST \
+                -H "Authorization: Bearer $APP_JWT" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/app/installations/${INSTALL_ID}/access_tokens" \
+                | jq -r '.token' || echo "")
+
+              if [ -z "$REPO_TOKEN" ] || [ "$REPO_TOKEN" = "null" ]; then
+                echo "  ⚠ Could not mint token for installation ${INSTALL_ID}, skipping."
+                continue
+              fi
+
+              echo "::add-mask::$REPO_TOKEN"
+              INSTALL_TOKEN[$INSTALL_ID]="$REPO_TOKEN"
+            fi
+
+            # ------------------------------------------------------------------
+            # List workflow files in the target repo
+            # ------------------------------------------------------------------
+            WORKFLOW_FILES=$(GH_TOKEN="$REPO_TOKEN" gh api \
+              "repos/${REPO}/contents/.github/workflows" \
+              --jq '.[] | select(.type == "file") | select(.name | test("\\.(yml|yaml)$")) | .name' \
+              2>/dev/null) || {
+                echo "  ↳ No .github/workflows directory (or no access), skipping."
+                continue
+              }
+
+            if [ -z "$WORKFLOW_FILES" ]; then
+              echo "  ↳ No YAML workflow files found, skipping."
+              continue
+            fi
+
+            # ------------------------------------------------------------------
+            # Inspect each workflow file for the reusable workflow reference
+            # ------------------------------------------------------------------
+            MATCHED_FILE=""
+            while IFS= read -r WF_FILE; do
+              [ -z "$WF_FILE" ] && continue
+              echo "  ↳ Inspecting ${WF_FILE}..."
+
+              FILE_CONTENT=$(GH_TOKEN="$REPO_TOKEN" gh api \
+                "repos/${REPO}/contents/.github/workflows/${WF_FILE}" \
+                --jq '.content' \
+                2>/dev/null | base64 --decode 2>/dev/null) || {
+                  echo "    ⚠ Could not fetch content for ${WF_FILE}, skipping."
+                  continue
+                }
+
+              if echo "$FILE_CONTENT" | grep -qE "$PATTERN"; then
+                echo "  ✓ Match found in ${WF_FILE}"
+                MATCHED_FILE="$WF_FILE"
+                break
+              fi
+            done <<< "$WORKFLOW_FILES"
+
+            if [ -n "$MATCHED_FILE" ]; then
+              ELIGIBLE=$(( ELIGIBLE + 1 ))
+              if [ "$FIRST_ENTRY" = true ]; then
+                FIRST_ENTRY=false
+              else
+                echo ',' >> /tmp/eligible-repos.json
+              fi
+              printf '  {"repo":"%s","workflow_file":"%s"}' \
+                "$REPO" "$MATCHED_FILE" >> /tmp/eligible-repos.json
+            fi
+
+          done < /tmp/all-repos.txt
+
+          echo '' >> /tmp/eligible-repos.json
+          echo ']' >> /tmp/eligible-repos.json
+
+          # Validate and compact the JSON
+          jq -c '.' /tmp/eligible-repos.json > /tmp/eligible-repos-compact.json
+          mv /tmp/eligible-repos-compact.json /tmp/eligible-repos.json
+
+          echo "---"
+          echo "Total repos checked : ${TOTAL}"
+          echo "Eligible repos found: ${ELIGIBLE}"
+
+          echo "TOTAL_REPOS=${TOTAL}"       >> "$GITHUB_ENV"
+          echo "ELIGIBLE_REPOS=${ELIGIBLE}" >> "$GITHUB_ENV"
+          echo "eligible_count=${ELIGIBLE}" >> "$GITHUB_OUTPUT"
+
+      # -----------------------------------------------------------------------
+      # Step 4: Build the matrix JSON output.
+      #
+      # Converts /tmp/eligible-repos.json (array) into a GitHub Actions matrix
+      # object: {"repo": [...]}
+      # Falls back to {"repo": []} if no eligible repos were found.
+      # Also writes eligible-repos.json to the workspace for artifact upload.
+      # -----------------------------------------------------------------------
+      - name: Build matrix JSON
+        id: build-matrix
+        run: |
+          set -euo pipefail
+
+          if [ ! -s /tmp/eligible-repos.json ]; then
+            MATRIX='{"repo":[]}'
+            ELIGIBLE_COUNT=0
+          else
+            MATRIX=$(jq -c '{repo: .}' /tmp/eligible-repos.json)
+            ELIGIBLE_COUNT=$(jq 'length' /tmp/eligible-repos.json)
+          fi
+
+          echo "matrix=${MATRIX}"               >> "$GITHUB_OUTPUT"
+          echo "eligible_count=${ELIGIBLE_COUNT}" >> "$GITHUB_OUTPUT"
+
+          echo "Matrix JSON: ${MATRIX}"
+          echo "Eligible repo count: ${ELIGIBLE_COUNT}"
+
+          # Write the matrix JSON to workspace for artifact upload
+          echo "$MATRIX" | jq '.' > eligible-repos.json
+
+      # -----------------------------------------------------------------------
+      # Step 5: Upload eligible-repos.json as a workflow artifact.
+      # Retained for 1 day; consumed by orchestrate.yml via workflow_run trigger.
+      # -----------------------------------------------------------------------
+      - name: Upload eligible repos artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: eligible-repos
+          path: eligible-repos.json
+          retention-days: 1
+          if-no-files-found: warn
+
+      # -----------------------------------------------------------------------
+      # Step 6: Write job summary.
+      # Renders a Markdown summary in the Actions UI showing discovery results.
+      # Runs always so failures are still reported.
+      # -----------------------------------------------------------------------
+      - name: Write job summary
+        if: always()
+        run: |
+          set -euo pipefail
+
+          TOTAL="${TOTAL_REPOS:-0}"
+          ELIGIBLE="${ELIGIBLE_REPOS:-0}"
+
+          {
+            echo "## 🔍 Repository Discovery Summary"
+            echo ""
+            echo "| Metric | Value |"
+            echo "|--------|-------|"
+            echo "| Total repos checked | ${TOTAL} |"
+            echo "| Eligible repos found | ${ELIGIBLE} |"
+            echo ""
+
+            if [ "${ELIGIBLE}" -gt 0 ] && [ -f /tmp/eligible-repos.json ]; then
+              echo "### ✅ Eligible Repositories"
+              echo ""
+              echo "| Repository | Workflow File |"
+              echo "|------------|---------------|"
+              jq -r '.[] | "| `\(.repo)` | `\(.workflow_file)` |"' \
+                /tmp/eligible-repos.json
+            else
+              echo "### ℹ️ No eligible repositories found"
+              echo ""
+              echo "No installed repositories contain a workflow that references \`repo-task-core.yml\`."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
